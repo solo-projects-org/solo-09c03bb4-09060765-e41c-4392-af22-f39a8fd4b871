@@ -1,4 +1,5 @@
-"""关键流程自测：上传、锚点、校时、跨日原子性、并发交错、重启恢复、失败不留半版。"""
+"""关键流程自测：上传、锚点、校时、跨日原子性、并发交错、重启恢复、失败不留半版、
+供数归属（已发布/待发布/待校时 三态与版号一致性）。"""
 from __future__ import annotations
 
 import time
@@ -267,6 +268,11 @@ def test_failed_recalc_keeps_old_version(tmp_path, monkeypatch):
         after = c.get("/api/readings", params={"date": "2026-01-01"}).json()
         assert after["count"] == 1                   # 旧版完整，无半版
         assert [row["local_seconds"] for row in after["readings"]] == [100]
+        # 失败期间：旧版已发布点不得误报待校时；新点受锚点覆盖但未入版 → 待发布
+        pend = c.get("/api/pending").json()
+        assert pend["pending"] == []
+        assert [p["local_seconds"] for p in pend["pending_publish"]] == [150]
+        assert pend["pending_publish"][0]["anchor_version"] == 1
 
         monkeypatch.undo()  # 恢复 compute_calibration
         c.post("/api/recalc")
@@ -274,15 +280,172 @@ def test_failed_recalc_keeps_old_version(tmp_path, monkeypatch):
         assert calc["status"] == "idle" and not calc["dirty"]
         body = c.get("/api/readings", params={"date": "2026-01-01"}).json()
         assert sorted(row["local_seconds"] for row in body["readings"]) == [100, 150]
+        pend = c.get("/api/pending").json()
+        assert pend["pending"] == [] and pend["pending_publish"] == []
+
+
+# ---------------------------------------------------------------- 供数归属
+
+def test_published_not_pending_while_old_version_readable(tmp_path, monkeypatch):
+    """锚点更正收窄区间：旧版仍可读时，已发布点不得误报待校时；换版后分类一起更新。"""
+    with make_client(tmp_path, monkeypatch, worker="1", delay="0.8") as c:
+        upload(c, [(1, 100, 1.0), (1, 150, 2.0), (1, 200, 3.0)])
+        set_anchors(c, 1, 100, "2026-01-01T00:00:00Z", 200, "2026-01-01T00:10:00Z")
+        wait_idle(c)
+        # 更正锚点收窄到 [100,150]：点 200 在新区间外，但旧版仍发布它
+        set_anchors(c, 1, 100, "2026-01-01T00:00:00Z", 150, "2026-01-01T00:05:00Z",
+                    version=1)
+        # 重算延迟窗口内：按日结果仍是旧版三点，且三点都不在任何待办列表中
+        d = c.get("/api/readings", params={"date": "2026-01-01"}).json()
+        assert sorted(r["local_seconds"] for r in d["readings"]) == [100, 150, 200]
+        pend = c.get("/api/pending").json()
+        assert pend["pending"] == []
+        assert pend["pending_publish"] == []
+        wait_idle(c)
+        # 新版本生效：按日结果与分类一起更新 —— 200 退出已发布，转为待校时
+        d = c.get("/api/readings", params={"date": "2026-01-01"}).json()
+        assert sorted(r["local_seconds"] for r in d["readings"]) == [100, 150]
+        pend = c.get("/api/pending").json()
+        assert [(p["segment"], p["local_seconds"]) for p in pend["pending"]] == [(1, 200)]
+        assert "超出" in pend["pending"][0]["reason"]
+        assert pend["pending_publish"] == []
+
+
+def test_new_point_pending_publish_until_committed(tmp_path, monkeypatch):
+    """重算期间上传：新点未入版但受锚点覆盖 → 待发布；换版后转入按日结果。"""
+    with make_client(tmp_path, monkeypatch, worker="1", delay="0.8") as c:
+        upload(c, [(1, 100, 1.0)])
+        set_anchors(c, 1, 100, "2026-01-01T00:00:00Z", 200, "2026-01-01T00:10:00Z")
+        wait_idle(c)
+        v1 = c.get("/api/status").json()["calc"]["version"]
+
+        upload(c, [(1, 150, 2.0)])  # 触发带延迟的重算
+        # 窗口内：旧版按日结果不变；新点列为待发布而非待校时
+        d = c.get("/api/readings", params={"date": "2026-01-01"}).json()
+        assert [r["local_seconds"] for r in d["readings"]] == [100]
+        assert d["calc_version"] == v1
+        pend = c.get("/api/pending").json()
+        assert [p["local_seconds"] for p in pend["pending_publish"]] == [150]
+        assert pend["pending_publish"][0]["batch_id"] == 2
+        assert pend["pending_publish"][0]["row_no"] == 1
+        assert pend["pending"] == []
+        wait_idle(c)
+        # 新版本生效：新点入版，待发布清空，批次号/原行号/锚点版本保留
+        d = c.get("/api/readings", params={"date": "2026-01-01"}).json()
+        assert d["calc_version"] > v1
+        row = next(r for r in d["readings"] if r["local_seconds"] == 150)
+        assert row["batch_id"] == 2 and row["row_no"] == 1 and row["anchor_version"] == 1
+        pend = c.get("/api/pending").json()
+        assert pend["pending_publish"] == [] and pend["pending"] == []
+
+
+def test_response_version_always_matches_rows(tmp_path, monkeypatch):
+    """换版恰逢查询：响应版号、日期与每行读数版号始终同属一个已发布版本。"""
+    with make_client(tmp_path, monkeypatch, worker="1", delay="0.3") as c:
+        upload(c, [(1, 100, 1.0), (1, 150, 2.0)])
+        set_anchors(c, 1, 100, "2026-01-01T23:00:00Z", 200, "2026-01-02T01:00:00Z")
+        wait_idle(c)
+        # 跨日更正 + 连续触发多次换版，期间反复查询两个日期
+        set_anchors(c, 1, 100, "2026-01-02T23:00:00Z", 200, "2026-01-03T01:00:00Z",
+                    version=1)
+        upload(c, [(1, 120, 3.0)])
+        for _ in range(40):
+            for day in ("2026-01-01", "2026-01-02", "2026-01-03"):
+                d = c.get("/api/readings", params={"date": day}).json()
+                assert d["date"] == day
+                assert all(r["calc_version"] == d["calc_version"] for r in d["readings"])
+                pend = c.get("/api/pending").json()
+                # 任何读数不得同时出现在按日结果与待办列表中
+                published_secs = {(r["segment"], r["local_seconds"]) for r in d["readings"]}
+                for lst in (pend["pending"], pend["pending_publish"]):
+                    todo_secs = {(q["segment"], q["local_seconds"]) for q in lst}
+                    assert not todo_secs & published_secs
+            time.sleep(0.02)
+        wait_idle(c)
+        # 三点最终全部入版：100/120 → 01-02，150 → 01-03（恰跨日）
+        d2 = c.get("/api/readings", params={"date": "2026-01-02"}).json()
+        d3 = c.get("/api/readings", params={"date": "2026-01-03"}).json()
+        assert d2["count"] == 2 and d3["count"] == 1
+        assert d2["calc_version"] == d3["calc_version"]  # 同属最后一次换版
+
+
+def test_failed_recalc_after_correction_keeps_attribution(tmp_path, monkeypatch):
+    """更正锚点 + 重算失败：旧版已发布点不误报待校时；恢复后分类随新版一起更新。"""
+    with make_client(tmp_path, monkeypatch) as c:  # 同步重算模式
+        upload(c, [(1, 100, 1.0), (1, 200, 2.0)])
+        set_anchors(c, 1, 100, "2026-01-01T00:00:00Z", 200, "2026-01-01T00:10:00Z")
+        v1 = c.get("/api/status").json()["calc"]["version"]
+
+        from app import calibration
+
+        def boom(readings, anchors):
+            raise RuntimeError("模拟计算失败")
+
+        monkeypatch.setattr(calibration, "compute_calibration", boom)
+        # 更正锚点收窄到 [100,150]：点 200 将超出新区间，但重算失败 → 旧版保留
+        r = set_anchors(c, 1, 100, "2026-01-01T00:00:00Z", 150, "2026-01-01T00:05:00Z",
+                        version=1)
+        assert r.status_code == 200
+        calc = c.get("/api/status").json()["calc"]
+        assert calc["status"] == "failed" and calc["version"] == v1
+        # 旧版两点仍完整可读，且都不列入任何待办
+        d = c.get("/api/readings", params={"date": "2026-01-01"}).json()
+        assert sorted(x["local_seconds"] for x in d["readings"]) == [100, 200]
+        assert d["calc_version"] == v1
+        pend = c.get("/api/pending").json()
+        assert pend["pending"] == [] and pend["pending_publish"] == []
+
+        monkeypatch.undo()
+        c.post("/api/recalc")
+        calc = c.get("/api/status").json()["calc"]
+        assert calc["status"] == "idle" and not calc["dirty"]
+        # 新版生效：200 退出按日结果并转为待校时（超出新区间）
+        d = c.get("/api/readings", params={"date": "2026-01-01"}).json()
+        assert [x["local_seconds"] for x in d["readings"]] == [100]
+        pend = c.get("/api/pending").json()
+        assert [(p["segment"], p["local_seconds"]) for p in pend["pending"]] == [(1, 200)]
+
+
+def test_restart_keeps_pending_publish_then_recovers(tmp_path, monkeypatch):
+    """重启后：未入版但受锚点覆盖的点仍标为待发布，补算后转入按日结果。"""
+    from app import calibration
+    from app.main import create_app
+
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "t.db"))
+    monkeypatch.setenv("WORKER_ENABLED", "0")
+    # 模拟“崩溃前没来得及重算”：屏蔽同步重算，只落库
+    orig = calibration.RecalcWorker.run_until_quiet
+    monkeypatch.setattr(calibration.RecalcWorker, "run_until_quiet", lambda self: None)
+    with TestClient(create_app()) as c1:
+        upload(c1, [(1, 100, 1.0)])
+        set_anchors(c1, 1, 100, "2026-01-01T00:00:00Z", 200, "2026-01-01T00:10:00Z")
+        pend = c1.get("/api/pending").json()
+        assert [p["local_seconds"] for p in pend["pending_publish"]] == [100]
+        assert pend["pending"] == []
+    monkeypatch.setattr(calibration.RecalcWorker, "run_until_quiet", orig)
+    # 重启（后台线程仍关闭）：分类关系保持 —— 待发布不丢、不错标为待校时
+    with TestClient(create_app()) as c2:
+        pend = c2.get("/api/pending").json()
+        assert [p["local_seconds"] for p in pend["pending_publish"]] == [100]
+        assert pend["pending"] == []
+        assert c2.get("/api/readings", params={"date": "2026-01-01"}).json()["count"] == 0
+        c2.post("/api/recalc")  # 手动补算
+        d = c2.get("/api/readings", params={"date": "2026-01-01"}).json()
+        assert d["count"] == 1 and d["readings"][0]["local_seconds"] == 100
+        pend = c2.get("/api/pending").json()
+        assert pend["pending_publish"] == [] and pend["pending"] == []
 
 
 # ---------------------------------------------------------------- 页面
 
 def test_html_pages_render(client):
-    upload(client, [(1, 100, 1.0)])
+    upload(client, [(1, 100, 1.0), (2, 7, 2.0)])  # 段 2 无锚点 → 待校时
     set_anchors(client, 1, 100, "2026-01-01T00:00:00Z", 200, "2026-01-01T00:10:00Z")
     for path in ["/", "/upload", "/anchors", "/query?date=2026-01-01"]:
         r = client.get(path)
         assert r.status_code == 200 and "text/html" in r.headers["content-type"], path
     html = client.get("/query?date=2026-01-01").text
     assert "批次号" in html and "原行号" in html and "锚点版本" in html
+    assert "待发布读数" in html and "待校时读数" in html
+    assert "未设置" in html  # 段 2 的待校时原因
+    assert "待发布" in client.get("/").text  # 状态页含待发布计数

@@ -144,16 +144,20 @@ def create_app() -> FastAPI:
 
     @app.get("/query", response_class=HTMLResponse)
     def query_page(request: Request, date: str = ""):
-        result, error = None, None
-        if date.strip():
-            try:
-                result = services.query_by_date(db, date)
-            except ServiceError as exc:
-                error = exc.message
-        pending = services.pending_readings(db)
-        return render(request, "query.html", date=date, result=result, error=error,
-                      pending=pending[:200], pending_count=len(pending),
-                      calc=services.calc_info(db), msg="", ok=1)
+        # 整页（按日结果 + 待发布/待校时 + 重算状态）来自同一已发布快照
+        error = None
+        try:
+            data = services.query_page_data(db, date)
+        except ServiceError as exc:
+            error = exc.message
+            data = services.query_page_data(db, "")
+        return render(request, "query.html", date=date, result=data["result"],
+                      error=error,
+                      pending_publish=data["pending_publish"][:200],
+                      pending_publish_count=len(data["pending_publish"]),
+                      pending=data["pending"][:200],
+                      pending_count=len(data["pending"]),
+                      calc=data["calc"], msg="", ok=1)
 
     # ------------------------------------------------------------ JSON API
 
@@ -212,8 +216,7 @@ def create_app() -> FastAPI:
 
     @app.get("/api/pending")
     def api_pending():
-        pend = services.pending_readings(db)
-        return {"count": len(pend), "pending": pend}
+        return services.pending_overview(db)
 
     return app
 

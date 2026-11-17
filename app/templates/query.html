@@ -10,7 +10,8 @@
     <button type="submit">查询</button>
   </form>
   {% if calc.dirty %}
-  <p class="warn">注意：当前有未完成的重算，查询结果可能随后变化（当前校时版本 v{{ calc.version }}）。</p>
+  <p class="warn">注意：当前有未完成的重算。本页按日结果与下方分类均对应已发布版本
+     v{{ calc.version }}；待发布读数将在下一版本生效。</p>
   {% endif %}
 </div>
 
@@ -37,7 +38,29 @@
 {% endif %}
 {% endif %}
 
+<h3>待发布读数（{{ pending_publish_count }} 条）</h3>
+<p class="hint">已受当前锚点覆盖、尚未进入已发布校时版本的读数；下一版本生效后即转入上方按日结果。</p>
+{% if pending_publish %}
+<table>
+  <tr><th>批次号</th><th>原行号</th><th>段号</th><th>本地秒数</th><th>温度</th>
+      <th>锚点版本</th><th>说明</th></tr>
+  {% for p in pending_publish %}
+  <tr>
+    <td>{{ p.batch_id }}</td><td>{{ p.row_no }}</td><td>{{ p.segment }}</td>
+    <td class="mono">{{ p.local_seconds }}</td><td>{{ p.temperature }}</td>
+    <td>v{{ p.anchor_version }}</td><td>{{ p.reason }}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% if pending_publish_count > pending_publish|length %}
+<p class="hint">仅显示前 {{ pending_publish|length }} 条，共 {{ pending_publish_count }} 条。</p>
+{% endif %}
+{% else %}
+<p class="hint">没有待发布的读数。</p>
+{% endif %}
+
 <h3>待校时读数（{{ pending_count }} 条）</h3>
+<p class="hint">未受当前锚点覆盖（未设锚点或超出锚点区间）的读数，需先补录或更正锚点。</p>
 {% if pending %}
 <table>
   <tr><th>批次号</th><th>原行号</th><th>段号</th><th>本地秒数</th><th>温度</th><th>原因</th></tr>

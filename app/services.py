@@ -140,23 +140,18 @@ def set_anchors(
     return new_version
 
 
-def list_anchors(db: Database) -> list[dict]:
-    anchors = [dict(a) for a in db.query("SELECT * FROM anchors ORDER BY segment")]
-    secs_by_seg: dict[int, list[int]] = {}
-    for r in db.query("SELECT segment, local_seconds FROM readings"):
-        secs_by_seg.setdefault(r["segment"], []).append(r["local_seconds"])
-    for a in anchors:
-        secs = secs_by_seg.get(a["segment"], [])
-        a["point_count"] = len(secs)
-        a["in_range_count"] = sum(1 for s in secs if a["local1"] <= s <= a["local2"])
-    return anchors
-
-
 # ---------------------------------------------------------------- 查询
+#
+# 供数归属原则：一次查询的版号、日期、读数与分类必须来自同一已发布结果，
+# 因此每个查询函数都在单个 db.snapshot() 内取齐全部数据（锁内串行，换版
+# 提交不会插入其中）。读数按三态归属：
+#   已发布 —— 在当前 calibrated 版本中，按日结果可读；绝不再列入待办；
+#   待发布 —— 未入版但已被当前锚点覆盖，下次换版即转入按日结果；
+#   待校时 —— 无锚点或超出锚点区间，需先补/改锚点，附原因仍可定位。
 
-def calc_info(db: Database) -> dict:
-    row = db.query_one("SELECT * FROM calc_state WHERE id = 1")
-    meta = {r["key"]: r["value"] for r in db.query("SELECT key, value FROM meta")}
+def _calc_info_conn(conn) -> dict:
+    row = conn.execute("SELECT * FROM calc_state WHERE id = 1").fetchone()
+    meta = {r["key"]: r["value"] for r in conn.execute("SELECT key, value FROM meta")}
     state_gen = int(meta.get("state_generation", "0"))
     calibrated_gen = int(meta.get("calibrated_generation", "-1"))
     return {
@@ -170,22 +165,81 @@ def calc_info(db: Database) -> dict:
     }
 
 
-def query_by_date(db: Database, date_str: str) -> dict:
+def calc_info(db: Database) -> dict:
+    return db.snapshot(_calc_info_conn)
+
+
+def _list_anchors_conn(conn) -> list[dict]:
+    anchors = [dict(a) for a in conn.execute("SELECT * FROM anchors ORDER BY segment")]
+    secs_by_seg: dict[int, list[int]] = {}
+    for r in conn.execute("SELECT segment, local_seconds FROM readings"):
+        secs_by_seg.setdefault(r["segment"], []).append(r["local_seconds"])
+    for a in anchors:
+        secs = secs_by_seg.get(a["segment"], [])
+        a["point_count"] = len(secs)
+        a["in_range_count"] = sum(1 for s in secs if a["local1"] <= s <= a["local2"])
+    return anchors
+
+
+def list_anchors(db: Database) -> list[dict]:
+    return db.snapshot(_list_anchors_conn)
+
+
+def _classify_conn(conn) -> tuple[list[dict], list[dict]]:
+    """把未入版读数分为（待发布, 待校时）；已发布的一律不列入待办。
+
+    判定基于同一快照内的已发布集合与当前锚点：换版提交不会插入其中，
+    因此分类与同时返回的按日结果必然同属一个已发布版本。
+    """
+    anchors = {a["segment"]: a for a in conn.execute("SELECT * FROM anchors")}
+    published = {
+        r["reading_id"] for r in conn.execute("SELECT reading_id FROM calibrated")
+    }
+    pending_publish: list[dict] = []
+    uncalibratable: list[dict] = []
+    for r in conn.execute(
+        "SELECT id, batch_id, row_no, segment, local_seconds, temperature"
+        " FROM readings ORDER BY id"
+    ):
+        d = dict(r)
+        if d["id"] in published:
+            continue  # 已发布：旧版仍可读，不得误报待校时
+        a = anchors.get(d["segment"])
+        if a is None:
+            uncalibratable.append({**d, "reason": "该段未设置校时锚点"})
+        elif not (a["local1"] <= d["local_seconds"] <= a["local2"]):
+            uncalibratable.append(
+                {**d, "reason": f"超出锚点范围 [{a['local1']}, {a['local2']}]"}
+            )
+        else:
+            pending_publish.append({
+                **d,
+                "anchor_version": a["version"],
+                "reason": "已受当前锚点覆盖，等待重算发布入版",
+            })
+    return pending_publish, uncalibratable
+
+
+_DAY_SQL = """
+SELECT c.reading_id, c.utc_time, c.anchor_version, c.calc_version,
+       r.batch_id, r.row_no, r.segment, r.local_seconds, r.temperature
+FROM calibrated c JOIN readings r ON r.id = c.reading_id
+WHERE c.utc_date = ?
+ORDER BY c.utc_time, c.reading_id
+"""
+
+
+def _parse_day(date_str: str):
     try:
-        day = datetime.strptime((date_str or "").strip(), "%Y-%m-%d").date()
+        return datetime.strptime((date_str or "").strip(), "%Y-%m-%d").date()
     except ValueError:
         raise ServiceError("日期格式须为 YYYY-MM-DD", code="BAD_DATE")
-    info = calc_info(db)
-    rows = db.query(
-        """
-        SELECT c.reading_id, c.utc_time, c.anchor_version, c.calc_version,
-               r.batch_id, r.row_no, r.segment, r.local_seconds, r.temperature
-        FROM calibrated c JOIN readings r ON r.id = c.reading_id
-        WHERE c.utc_date = ?
-        ORDER BY c.utc_time, c.reading_id
-        """,
-        (day.isoformat(),),
-    )
+
+
+def _day_result_conn(conn, day) -> dict:
+    """同一快照内取 版号 + 当日读数：响应版号与每行读数版号必然一致。"""
+    info = _calc_info_conn(conn)
+    rows = conn.execute(_DAY_SQL, (day.isoformat(),)).fetchall()
     return {
         "date": day.isoformat(),
         "calc_version": info["version"],
@@ -195,34 +249,62 @@ def query_by_date(db: Database, date_str: str) -> dict:
     }
 
 
-def pending_readings(db: Database) -> list[dict]:
-    """尚未进入当前校时版本的读数（无锚点或超出锚点范围），即“留存待校时”。"""
-    anchors = {a["segment"]: a for a in db.query("SELECT * FROM anchors")}
-    out = []
-    for r in db.query(
-        "SELECT id, batch_id, row_no, segment, local_seconds, temperature"
-        " FROM readings ORDER BY id"
-    ):
-        a = anchors.get(r["segment"])
-        if a is None:
-            reason = "该段未设置校时锚点"
-        elif not (a["local1"] <= r["local_seconds"] <= a["local2"]):
-            reason = f"超出锚点范围 [{a['local1']}, {a['local2']}]"
-        else:
-            continue
-        out.append({**dict(r), "reason": reason})
-    return out
+def query_by_date(db: Database, date_str: str) -> dict:
+    """按 UTC 日查询已发布读数；版号、日期、读数来自同一已发布结果。"""
+    day = _parse_day(date_str)
+    return db.snapshot(lambda conn: _day_result_conn(conn, day))
+
+
+def query_page_data(db: Database, date_str: str) -> dict:
+    """查询页整页数据：按日结果、待发布/待校时分类、重算状态，同一快照。"""
+    day = _parse_day(date_str) if (date_str or "").strip() else None
+
+    def fn(conn):
+        pending_publish, uncalibratable = _classify_conn(conn)
+        return {
+            "result": _day_result_conn(conn, day) if day is not None else None,
+            "calc": _calc_info_conn(conn),
+            "pending_publish": pending_publish,
+            "pending": uncalibratable,
+        }
+
+    return db.snapshot(fn)
+
+
+def pending_overview(db: Database) -> dict:
+    """待发布 + 待校时总览（同一快照，附所基于的已发布版号）。"""
+    def fn(conn):
+        info = _calc_info_conn(conn)
+        pending_publish, uncalibratable = _classify_conn(conn)
+        return {
+            "calc_version": info["version"],
+            "dirty": info["dirty"],
+            "count": len(pending_publish) + len(uncalibratable),
+            "pending_publish_count": len(pending_publish),
+            "pending_count": len(uncalibratable),
+            "pending_publish": pending_publish,
+            "pending": uncalibratable,
+        }
+
+    return db.snapshot(fn)
 
 
 def get_status(db: Database, cfg: Settings) -> dict:
-    accepted = db.query_one("SELECT COUNT(*) AS c FROM readings")["c"]
-    batches = [
-        dict(b) for b in db.query("SELECT * FROM batches ORDER BY id DESC LIMIT 100")
-    ]
-    return {
-        "points": {"accepted": accepted, "max": cfg.max_points},
-        "calc": calc_info(db),
-        "anchors": list_anchors(db),
-        "batches": batches,
-        "pending_count": len(pending_readings(db)),
-    }
+    """状态页/接口汇总：点数、重算状态、锚点、批次、两类待办，同一快照。"""
+    def fn(conn):
+        accepted = conn.execute("SELECT COUNT(*) AS c FROM readings").fetchone()["c"]
+        batches = [
+            dict(b)
+            for b in conn.execute("SELECT * FROM batches ORDER BY id DESC LIMIT 100")
+        ]
+        pending_publish, uncalibratable = _classify_conn(conn)
+        return {
+            "points": {"accepted": accepted, "max": cfg.max_points},
+            "calc": _calc_info_conn(conn),
+            "anchors": _list_anchors_conn(conn),
+            "batches": batches,
+            "pending_count": len(uncalibratable),
+            "pending_publish_count": len(pending_publish),
+        }
+
+    return db.snapshot(fn)
